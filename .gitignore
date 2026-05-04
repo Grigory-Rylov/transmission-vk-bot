@@ -1,0 +1,16 @@
+# Binaries
+bot
+bot.log
+bot2.log
+debug.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Config with secrets
+config.json
+
+# OS files
+.DS_Store
+Thumbs.db
