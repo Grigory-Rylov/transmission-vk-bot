@@ -14,13 +14,14 @@ import (
 
 // Client communicates with a Transmission RPC daemon.
 type Client struct {
-	url          string
-	username     string
-	password     string
-	sessionID    string
+	url           string
+	username      string
+	password      string
+	sessionID     string
 	defaultFolder string
+	categories    map[string]string
 	currentDir    string
-	http         *http.Client
+	http          *http.Client
 }
 
 // NewClient creates a new Transmission RPC client.
@@ -29,14 +30,26 @@ func NewClient(cfg Config) *Client {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	return &Client{
-		url:          cfg.URL,
-		username:     cfg.Username,
-		password:     cfg.Password,
+		url:           cfg.URL,
+		username:      cfg.Username,
+		password:      cfg.Password,
 		defaultFolder: cfg.DefaultFolder,
+		categories:    cfg.Categories,
 		http: &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: transport,
 		},
+	}
+}
+
+// GetConfig returns the client configuration.
+func (c *Client) GetConfig() *Config {
+	return &Config{
+		URL:           c.url,
+		Username:      c.username,
+		Password:      c.password,
+		DefaultFolder: c.defaultFolder,
+		Categories:    c.categories,
 	}
 }
 
@@ -157,29 +170,42 @@ func fieldsJSON(fields ...string) json.RawMessage {
 
 // torrentFields are the fields we request for each torrent.
 var torrentFields = fieldsJSON(
-	"id", "name", "status", "downloadedEver", "leftUntilDone",
-	"sizeWhenDone", "eta", "rateDownload",
+	"id", "name", "status", "percentDone", "totalSize",
+	"sizeWhenDone", "leftUntilDone", "eta", "rateDownload",
+	"rateUpload", "uploadRatio", "downloadDir", "isFinished",
+	"addedDate", "doneDate",
+)
+
+// torrentFieldsFull includes all available fields for detailed status.
+var torrentFieldsFull = fieldsJSON(
+	"id", "name", "status", "percentDone", "totalSize", "sizeWhenDone",
+	"leftUntilDone", "eta", "rateDownload", "rateUpload", "uploadRatio",
+	"downloadDir", "isFinished", "addedDate", "doneDate", "error", "errorString",
 )
 
 // SetDownloadDir sets the download directory for subsequent torrent additions.
 func (c *Client) SetDownloadDir(subDir string) {
-	if subDir == "" {
-		subDir = ""
-		return
+	c.currentDir = ""
+	if subDir != "" {
+		c.currentDir = c.defaultFolder + "/" + subDir
 	}
-	c.currentDir = c.defaultFolder + "/" + subDir
 }
 
-// AddTorrent adds a torrent by magnet link.
-func (c *Client) AddTorrent(magnetLink string, downloadDir string) (*TorrentStatus, error) {
+// AddTorrent adds a torrent by magnet link or base64-encoded .torrent file.
+// If the link starts with "magnet:", it's treated as a magnet link.
+// Otherwise, it's treated as base64-encoded torrent metainfo.
+func (c *Client) AddTorrent(data string, downloadDir string) (*TorrentStatus, error) {
 	// Set download directory if specified
 	if downloadDir != "" {
 		c.SetDownloadDir(downloadDir)
 	}
 
-	// Build arguments with optional download directory
-	argsMap := map[string]interface{}{
-		"metainfo": magnetLink,
+	// Build arguments based on whether it's a magnet or file
+	argsMap := map[string]interface{}{}
+	if strings.HasPrefix(data, "magnet:") {
+		argsMap["filename"] = data
+	} else {
+		argsMap["metainfo"] = data
 	}
 	if c.currentDir != "" {
 		argsMap["download-dir"] = c.currentDir
@@ -195,6 +221,14 @@ func (c *Client) AddTorrent(magnetLink string, downloadDir string) (*TorrentStat
 	var added map[string]interface{}
 	if err := json.Unmarshal(resp.Arguments, &added); err != nil {
 		return nil, fmt.Errorf("parse add response: %w", err)
+	}
+
+	// Check for duplicate torrent
+	if dup, ok := added["torrent-duplicate"].(map[string]interface{}); ok {
+		if idFloat, _ := dup["id"].(float64); idFloat > 0 {
+			id := int(idFloat)
+			return c.getTorrentStatusByID(id)
+		}
 	}
 
 	torrents, ok := added["torrent-added"].([]interface{})
@@ -213,6 +247,53 @@ func (c *Client) AddTorrent(magnetLink string, downloadDir string) (*TorrentStat
 
 	// Fetch full status
 	return c.getTorrentStatusByID(id)
+}
+
+// AddTorrentWithMagnet adds a torrent specifically by magnet link.
+func (c *Client) AddTorrentWithMagnet(magnetLink string, downloadDir string) (*TorrentStatus, error) {
+	return c.AddTorrent(magnetLink, downloadDir)
+}
+
+// AddTorrentFile adds a torrent from base64-encoded .torrent file content.
+func (c *Client) AddTorrentFile(base64Content string, downloadDir string) (*TorrentStatus, error) {
+	return c.AddTorrent(base64Content, downloadDir)
+}
+
+// CheckTorrentDuplicate checks if a torrent already exists and returns its ID.
+func (c *Client) CheckTorrentDuplicate(magnetLink string) (int, string, error) {
+	argsMap := map[string]interface{}{
+		"filename": magnetLink,
+	}
+	args, _ := json.Marshal(argsMap)
+
+	resp, err := c.doRPC("torrent-add", args, 0)
+	if err != nil {
+		return 0, "", err
+	}
+
+	var added map[string]interface{}
+	if err := json.Unmarshal(resp.Arguments, &added); err != nil {
+		return 0, "", err
+	}
+
+	// Check for duplicate
+	if dup, ok := added["torrent-duplicate"].(map[string]interface{}); ok {
+		if idFloat, _ := dup["id"].(float64); idFloat > 0 {
+			name, _ := dup["name"].(string)
+			return int(idFloat), name, ErrTorrentExists
+		}
+	}
+
+	// Check for added torrent
+	if torrents, ok := added["torrent-added"].([]interface{}); ok && len(torrents) > 0 {
+		if torrentData, ok := torrents[0].(map[string]interface{}); ok {
+			idFloat, _ := torrentData["id"].(float64)
+			name, _ := torrentData["name"].(string)
+			return int(idFloat), name, nil
+		}
+	}
+
+	return 0, "", nil
 }
 
 // getTorrentStatusByID fetches status for a single torrent by ID.
@@ -267,7 +348,7 @@ func (c *Client) GetStatus() ([]TorrentStatus, error) {
 
 // GetActiveStatus returns status of torrents that are not yet fully downloaded.
 func (c *Client) GetActiveStatus() ([]TorrentStatus, error) {
-	resp, err := c.doRPC("torrent-get", torrentFields, 1)
+	resp, err := c.doRPC("torrent-get", torrentFieldsFull, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +380,7 @@ func (c *Client) GetActiveStatus() ([]TorrentStatus, error) {
 
 // GetCompletedStatus returns status of completed (100% downloaded) torrents.
 func (c *Client) GetCompletedStatus() ([]TorrentStatus, error) {
-	resp, err := c.doRPC("torrent-get", torrentFields, 1)
+	resp, err := c.doRPC("torrent-get", torrentFieldsFull, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -329,6 +410,119 @@ func (c *Client) GetCompletedStatus() ([]TorrentStatus, error) {
 	return statuses, nil
 }
 
+// GetSessionStats returns Transmission session statistics.
+func (c *Client) GetSessionStats() (*SessionStats, error) {
+	resp, err := c.doRPC("session-stats", nil, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(resp.Arguments, &result); err != nil {
+		return nil, fmt.Errorf("parse session stats: %w", err)
+	}
+
+	stats := &SessionStats{}
+
+	// Parse top-level fields
+	if v, ok := result["active-torrent-count"].(float64); ok {
+		stats.ActiveTorrentCount = int64(v)
+	}
+	if v, ok := result["paused-torrent-count"].(float64); ok {
+		stats.PausedTorrentCount = int64(v)
+	}
+	if v, ok := result["torrent-count"].(float64); ok {
+		stats.TorrentCount = int64(v)
+	}
+	if v, ok := result["download-speed"].(float64); ok {
+		stats.DownloadSpeed = int64(v)
+	}
+	if v, ok := result["upload-speed"].(float64); ok {
+		stats.UploadSpeed = int64(v)
+	}
+
+	// Parse current-stats
+	if cs, ok := result["current-stats"].(map[string]interface{}); ok {
+		parseStats(&stats.CurrentStats, cs)
+	}
+
+	// Parse cumulative-stats
+	if cs, ok := result["cumulative-stats"].(map[string]interface{}); ok {
+		parseStats(&stats.CumulativeStats, cs)
+	}
+
+	return stats, nil
+}
+
+// parseStats extracts stats from a map.
+func parseStats(s *Stats, m map[string]interface{}) {
+	if v, ok := m["downloadedBytes"].(float64); ok {
+		s.DownloadedBytes = int64(v)
+	}
+	if v, ok := m["uploadedBytes"].(float64); ok {
+		s.UploadedBytes = int64(v)
+	}
+	if v, ok := m["filesAdded"].(float64); ok {
+		s.FilesAdded = int64(v)
+	}
+	if v, ok := m["sessionCount"].(float64); ok {
+		s.SessionCount = int64(v)
+	}
+	if v, ok := m["secondsActive"].(float64); ok {
+		s.SecondsActive = int64(v)
+	}
+}
+
+// PauseTorrent stops a torrent by ID.
+func (c *Client) PauseTorrent(id int) error {
+	args, _ := json.Marshal(map[string]interface{}{
+		"ids": []int{id},
+	})
+	_, err := c.doRPC("torrent-stop", args, 1)
+	if err != nil {
+		return fmt.Errorf("pause torrent %d: %w", id, err)
+	}
+	return nil
+}
+
+// ResumeTorrent starts/resumes a torrent by ID.
+func (c *Client) ResumeTorrent(id int) error {
+	args, _ := json.Marshal(map[string]interface{}{
+		"ids": []int{id},
+	})
+	_, err := c.doRPC("torrent-start", args, 1)
+	if err != nil {
+		return fmt.Errorf("resume torrent %d: %w", id, err)
+	}
+	return nil
+}
+
+// RemoveTorrent removes a torrent by ID.
+func (c *Client) RemoveTorrent(id int, deleteLocalData bool) error {
+	args, _ := json.Marshal(map[string]interface{}{
+		"ids":             []int{id},
+		"delete-local-data": deleteLocalData,
+	})
+	_, err := c.doRPC("torrent-remove", args, 1)
+	if err != nil {
+		return fmt.Errorf("remove torrent %d: %w", id, err)
+	}
+	return nil
+}
+
+// RemoveTorrents removes multiple torrents.
+func (c *Client) RemoveTorrents(ids []int, deleteLocalData bool) error {
+	args, _ := json.Marshal(map[string]interface{}{
+		"ids":             ids,
+		"delete-local-data": deleteLocalData,
+	})
+	_, err := c.doRPC("torrent-remove", args, 1)
+	if err != nil {
+		return fmt.Errorf("remove torrents: %w", err)
+	}
+	return nil
+}
+
 // parseTorrent converts a raw torrent map to TorrentStatus.
 func parseTorrent(raw interface{}) (*TorrentStatus, error) {
 	m, ok := raw.(map[string]interface{})
@@ -347,31 +541,47 @@ func parseTorrent(raw interface{}) (*TorrentStatus, error) {
 
 	status := getString("status")
 	statusMap := map[string]string{
-		"1":  "downloading",
-		"2":  "seeding",
-		"3":  "stopped",
-		"4":  "checking",
+		"0": "stopped",
+		"1": "check wait",
+		"2": "checking",
+		"3": "download wait",
+		"4": "downloading",
+		"5": "seed wait",
+		"6": "seeding",
 	}
 	statusLabel := statusMap[status]
 	if statusLabel == "" {
 		statusLabel = status
 	}
 
-	downloaded := int64(getFloat("downloadedEver"))
-	totalSize := int64(getFloat("sizeWhenDone"))
+	totalSize := int64(getFloat("totalSize"))
+	percentDone := getFloat("percentDone")
 	var progress float64
-	if totalSize > 0 {
-		progress = (float64(downloaded) / float64(totalSize)) * 100
+	if percentDone > 1.0 {
+		progress = 100.0
+	} else {
+		progress = percentDone * 100.0
 	}
-	if progress > 100 {
-		progress = 100
+
+	// Calculate downloaded from percentDone if available
+	downloaded := int64(percentDone * float64(totalSize))
+	if downloaded > totalSize {
+		downloaded = totalSize
 	}
 
 	speed := int64(getFloat("rateDownload"))
+	uploadSpeed := int64(getFloat("rateUpload"))
+	ratio := getFloat("uploadRatio")
 	eta := int64(getFloat("eta"))
 	if eta < 0 {
 		eta = -1
 	}
+
+	isFinished := false
+	if v, ok := m["isFinished"].(bool); ok {
+		isFinished = v
+	}
+	leftUntilDone := int64(getFloat("leftUntilDone"))
 
 	return &TorrentStatus{
 		ID:            int(getFloat("id")),
@@ -381,7 +591,12 @@ func parseTorrent(raw interface{}) (*TorrentStatus, error) {
 		Downloaded:    downloaded,
 		TotalSize:     totalSize,
 		DownloadSpeed: speed,
+		UploadSpeed:   uploadSpeed,
+		UploadRatio:   ratio,
 		ETA:           eta,
+		DownloadDir:   getString("downloadDir"),
+		IsFinished:    isFinished,
+		LeftUntilDone: leftUntilDone,
 	}, nil
 }
 
@@ -395,16 +610,19 @@ func FormatStatus(statuses []TorrentStatus) string {
 	sb.WriteString("📥 Active Downloads:\n\n")
 
 	for i, ts := range statuses {
-		sb.WriteString(fmt.Sprintf("%d. 🔥 %s\n", i+1, ts.Name))
+		statusEmoji := getTorrentStatusEmoji(ts.Status)
+		sb.WriteString(fmt.Sprintf("%d. %s %s\n", i+1, statusEmoji, ts.Name))
 		sb.WriteString(fmt.Sprintf("   ⬇️  Speed: %s\n", formatSpeed(ts.DownloadSpeed)))
-		sb.WriteString(fmt.Sprintf("   📊 Progress: %.0f%%\n", ts.Progress))
+		sb.WriteString(fmt.Sprintf("   ⬆️  Speed: %s\n", formatSpeed(ts.UploadSpeed)))
+		sb.WriteString(fmt.Sprintf("   📊 Progress: %.1f%%\n", ts.Progress))
 		sb.WriteString(fmt.Sprintf("   💾 Downloaded: %s / %s\n",
 			formatBytes(ts.Downloaded),
 			formatBytes(ts.TotalSize),
 		))
+		sb.WriteString(fmt.Sprintf("   📁 Upload Ratio: %.2f\n", ts.UploadRatio))
 		if ts.ETA < 0 {
 			sb.WriteString("   ⏱️  ETA: —\n")
-		} else if ts.Status == "downloading" {
+		} else if ts.Status == "downloading" || ts.Status == "download wait" {
 			sb.WriteString(fmt.Sprintf("   ⏱️  ETA: %s\n", formatETA(ts.ETA)))
 		} else {
 			sb.WriteString("   ⏱️  ETA: —\n")
@@ -416,6 +634,79 @@ func FormatStatus(statuses []TorrentStatus) string {
 	}
 
 	return sb.String()
+}
+
+// FormatStatusWithSessionStats returns a human-readable status string with session stats.
+func FormatStatusWithSessionStats(stats *SessionStats, active []TorrentStatus) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("📊 <b>Transmission Statistics</b>\n\n"))
+	sb.WriteString(fmt.Sprintf("• Total torrents: %d\n", stats.TorrentCount))
+	sb.WriteString(fmt.Sprintf("• Active downloads: %d\n", stats.ActiveTorrentCount))
+	sb.WriteString(fmt.Sprintf("• Paused: %d\n", stats.PausedTorrentCount))
+	sb.WriteString(fmt.Sprintf("• Download speed: %s\n", formatSpeed(stats.DownloadSpeed)))
+	sb.WriteString(fmt.Sprintf("• Upload speed: %s\n", formatSpeed(stats.UploadSpeed)))
+	sb.WriteString(fmt.Sprintf("• Total downloaded: %s\n", formatBytes(stats.CumulativeStats.DownloadedBytes)))
+	sb.WriteString(fmt.Sprintf("• Total uploaded: %s\n", formatBytes(stats.CumulativeStats.UploadedBytes)))
+	if stats.CumulativeStats.DownloadedBytes > 0 {
+		ratio := float64(stats.CumulativeStats.UploadedBytes) / float64(stats.CumulativeStats.DownloadedBytes)
+		sb.WriteString(fmt.Sprintf("• Overall ratio: %.2f\n", ratio))
+	}
+	sb.WriteString("\n")
+
+	if len(active) > 0 {
+		sb.WriteString("📥 <b>Active downloads:</b>\n\n")
+		for i, ts := range active {
+			statusEmoji := getTorrentStatusEmoji(ts.Status)
+			sb.WriteString(fmt.Sprintf("%d. %s %s\n", i+1, statusEmoji, ts.Name))
+			sb.WriteString(fmt.Sprintf("   Progress: %.1f%% | Speed: ⬇️%s ⬆️%s\n",
+				ts.Progress, formatSpeed(ts.DownloadSpeed), formatSpeed(ts.UploadSpeed)))
+			if i < len(active)-1 {
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	return sb.String()
+}
+
+// FormatList returns a human-readable list of all torrents.
+func FormatList(statuses []TorrentStatus) string {
+	if len(statuses) == 0 {
+		return "📭 No torrents found."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📋 <b>All Torrents:</b>\n\n")
+
+	for _, ts := range statuses {
+		statusEmoji := getTorrentStatusEmoji(ts.Status)
+		sb.WriteString(fmt.Sprintf("<b>%s</b> %s\n", statusEmoji, ts.Name))
+		sb.WriteString(fmt.Sprintf("   ID: %d | Progress: %.1f%%\n", ts.ID, ts.Progress))
+		sb.WriteString(fmt.Sprintf("   Size: %s | ⬇️ %s | ⬆️ %s\n",
+			formatBytes(ts.TotalSize), formatSpeed(ts.DownloadSpeed), formatSpeed(ts.UploadSpeed)))
+		sb.WriteString(fmt.Sprintf("   Ratio: %.2f | ETA: %s\n", ts.UploadRatio, formatETA(ts.ETA)))
+		sb.WriteString(fmt.Sprintf("   Path: %s\n", ts.DownloadDir))
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+// getTorrentStatusEmoji returns an emoji for the torrent status.
+func getTorrentStatusEmoji(status string) string {
+	switch status {
+	case "stopped":
+		return "⏸️"
+	case "check wait", "checking":
+		return "🔍"
+	case "download wait", "downloading":
+		return "⬇️"
+	case "seed wait", "seeding":
+		return "⬆️"
+	default:
+		return "❓"
+	}
 }
 
 // FormatStatusWithCompleted returns a human-readable status string including completed torrents section.
