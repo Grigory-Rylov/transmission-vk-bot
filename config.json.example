@@ -1,0 +1,11 @@
+{
+  "vk_token": "your_vk_api_token_here",
+  "vk_api_version": "5.200",
+  "long_poll_wait": 25,
+  "transmission": {
+    "url": "http://192.168.0.192:9091/transmission/rpc",
+    "username": "transmission",
+    "password": "your_transmission_password",
+    "default_folder": "/home/user/Downloads"
+  }
+}
